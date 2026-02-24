@@ -9,6 +9,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -1348,7 +1351,9 @@ func (t *AcademicFetchPaperTool) Name() string {
 
 func (t *AcademicFetchPaperTool) Description() string {
 	return "Download a specific academic paper by URL or DOI and save it to a file. " +
-		"PDFs are saved as binary .pdf files. HTML/text pages are saved as .txt files with extracted text. " +
+		"Tries to obtain a PDF first; if the URL returns an HTML page, looks for an embedded PDF link " +
+		"(e.g. citation_pdf_url meta tag or .pdf href) and downloads that instead. " +
+		"Falls back to saving extracted text as a .txt file if no PDF can be found. " +
 		"Supports Unpaywall to find open-access PDFs by DOI."
 }
 
@@ -1382,7 +1387,7 @@ func (t *AcademicFetchPaperTool) Execute(ctx context.Context, args map[string]an
 	paperURL, _ := args["url"].(string)
 	doi, _ := args["doi"].(string)
 
-	// If no URL given but DOI provided, try Unpaywall
+	// If no URL given but DOI provided, try Unpaywall for a direct PDF URL first.
 	if paperURL == "" && doi != "" {
 		if t.emailForPolite == "" {
 			return ErrorResult("email_for_polite must be set in academic tools config to use DOI/Unpaywall lookup")
@@ -1391,10 +1396,12 @@ func (t *AcademicFetchPaperTool) Execute(ctx context.Context, args map[string]an
 		if err != nil {
 			return ErrorResult(fmt.Sprintf("Unpaywall lookup failed for DOI %s: %v", doi, err))
 		}
-		if oaURL == "" {
-			return ErrorResult(fmt.Sprintf("no open-access version found for DOI %s", doi))
+		if oaURL != "" {
+			paperURL = oaURL
+		} else {
+			// Fall back to the DOI resolver page
+			paperURL = "https://doi.org/" + doi
 		}
-		paperURL = oaURL
 	}
 
 	if paperURL == "" {
@@ -1407,40 +1414,25 @@ func (t *AcademicFetchPaperTool) Execute(ctx context.Context, args map[string]an
 		return ErrorResult("only http/https URLs are supported")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", paperURL, nil)
-	if err != nil {
-		return ErrorResult(fmt.Sprintf("failed to create request: %v", err))
+	body, finalURL, contentType, fetchErr := fetchURLWithRedirects(ctx, paperURL)
+	if fetchErr != nil {
+		return ErrorResult(fetchErr.Error())
 	}
-	req.Header.Set("User-Agent", userAgent)
 
-	client := &http.Client{
-		Timeout: 120 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return fmt.Errorf("stopped after 5 redirects")
+	isPDF := detectPDF(body, contentType, finalURL)
+
+	// PDF-first: if we got HTML, look for an embedded PDF link and retry.
+	if !isPDF && strings.Contains(contentType, "text/html") {
+		if pdfLink := findPDFURLInHTML(string(body), finalURL); pdfLink != "" {
+			pdfBody, _, pdfCT, err := fetchURLWithRedirects(ctx, pdfLink)
+			if err == nil && detectPDF(pdfBody, pdfCT, pdfLink) {
+				body = pdfBody
+				contentType = pdfCT
+				finalURL = pdfLink
+				isPDF = true
 			}
-			return nil
-		},
+		}
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return ErrorResult(fmt.Sprintf("request failed: %v", err))
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return ErrorResult(fmt.Sprintf("HTTP %d when fetching %s", resp.StatusCode, paperURL))
-	}
-
-	contentType := resp.Header.Get("Content-Type")
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return ErrorResult(fmt.Sprintf("failed to read response: %v", err))
-	}
-
-	isPDF := strings.Contains(contentType, "application/pdf") ||
-		strings.HasSuffix(strings.ToLower(paperURL), ".pdf") ||
-		(len(body) >= 4 && string(body[:4]) == "%PDF")
 
 	var saveData []byte
 	var fileType string
@@ -1449,7 +1441,6 @@ func (t *AcademicFetchPaperTool) Execute(ctx context.Context, args map[string]an
 		saveData = body
 		fileType = "PDF"
 	} else {
-		// Extract text for HTML/text content
 		var text string
 		if strings.Contains(contentType, "text/html") {
 			wft := &WebFetchTool{}
@@ -1457,8 +1448,7 @@ func (t *AcademicFetchPaperTool) Execute(ctx context.Context, args map[string]an
 		} else {
 			text = string(body)
 		}
-		// Add source metadata header
-		header := fmt.Sprintf("Source: %s\nFetched: %s\n\n", paperURL, time.Now().UTC().Format(time.RFC3339))
+		header := fmt.Sprintf("Source: %s\nFetched: %s\n\n", finalURL, time.Now().UTC().Format(time.RFC3339))
 		text = header + text
 		saveData = []byte(text)
 		fileType = "text"
@@ -1487,4 +1477,609 @@ func truncateBody(body []byte) string {
 		return string(body[:200]) + "..."
 	}
 	return string(body)
+}
+
+// fetchURLWithRedirects fetches a URL, following up to 5 redirects, and returns
+// the response body, the final URL after redirects, the Content-Type, and any error.
+func fetchURLWithRedirects(ctx context.Context, rawURL string) (body []byte, finalURL string, contentType string, err error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
+	if err != nil {
+		return nil, rawURL, "", fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("User-Agent", userAgent)
+
+	client := &http.Client{
+		Timeout: 120 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("stopped after 5 redirects")
+			}
+			return nil
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, rawURL, "", fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, rawURL, "", fmt.Errorf("HTTP %d when fetching %s", resp.StatusCode, rawURL)
+	}
+
+	body, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, rawURL, "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	finalURL = resp.Request.URL.String()
+	contentType = resp.Header.Get("Content-Type")
+	return body, finalURL, contentType, nil
+}
+
+// detectPDF returns true if the data/URL/content-type combination indicates a PDF.
+func detectPDF(body []byte, contentType, fetchedURL string) bool {
+	return strings.Contains(contentType, "application/pdf") ||
+		strings.HasSuffix(strings.ToLower(fetchedURL), ".pdf") ||
+		(len(body) >= 4 && string(body[:4]) == "%PDF")
+}
+
+// findPDFURLInHTML searches HTML content for a direct link to a PDF version of the page.
+// Supports: citation_pdf_url meta tag (Highwire/Google Scholar), href="...pdf", data-pdf-url,
+// and <a type="application/pdf"> patterns.
+func findPDFURLInHTML(htmlContent, baseURL string) string {
+	patterns := []*regexp.Regexp{
+		// <meta name="citation_pdf_url" content="..."> (Highwire, Google Scholar)
+		regexp.MustCompile(`(?i)<meta[^>]+name=["']citation_pdf_url["'][^>]+content=["']([^"']+)["']`),
+		regexp.MustCompile(`(?i)<meta[^>]+content=["']([^"']+)["'][^>]+name=["']citation_pdf_url["']`),
+		// data-pdf-url attribute
+		regexp.MustCompile(`(?i)data-pdf-url=["']([^"']+)["']`),
+		// <a href="...pdf"> (must end with .pdf or have /pdf in path)
+		regexp.MustCompile(`(?i)href=["']([^"']+\.pdf(?:[?#][^"']*)?)["']`),
+		// <a href="..." type="application/pdf">
+		regexp.MustCompile(`(?i)href=["']([^"']+)["'][^>]+type=["']application/pdf["']`),
+		regexp.MustCompile(`(?i)type=["']application/pdf["'][^>]+href=["']([^"']+)["']`),
+	}
+
+	for _, re := range patterns {
+		m := re.FindStringSubmatch(htmlContent)
+		if len(m) > 1 {
+			pdfURL := m[1]
+			if !strings.HasPrefix(pdfURL, "http") && baseURL != "" {
+				base, err := url.Parse(baseURL)
+				if err == nil {
+					ref, err := url.Parse(pdfURL)
+					if err == nil {
+						pdfURL = base.ResolveReference(ref).String()
+					}
+				}
+			}
+			return pdfURL
+		}
+	}
+	return ""
+}
+
+// --- PDF text extraction ---
+
+// extractTextFromPDF performs a best-effort text extraction from PDF bytes using
+// the PDF content-stream operators BT/ET and Tj/TJ. Works for unencrypted PDFs
+// with standard (non-CID) font encodings. Falls back to printable-ASCII scanning
+// when the BT/ET pass yields too little text.
+func extractTextFromPDF(data []byte) string {
+	s := string(data)
+	var parts []string
+
+	// Match BT...ET blocks (PDF text object delimiters)
+	btRe := regexp.MustCompile(`(?s)BT\s+(.*?)\s+ET`)
+	// Match (string) Tj / TJ literals inside a BT block
+	tjRe := regexp.MustCompile(`\(([^)\\]*(?:\\.[^)\\]*)*)\)\s*Tj`)
+	tjArrayRe := regexp.MustCompile(`\[([^\]]+)\]\s*TJ`)
+	strInArrayRe := regexp.MustCompile(`\(([^)\\]*(?:\\.[^)\\]*)*)\)`)
+
+	for _, bt := range btRe.FindAllStringSubmatch(s, -1) {
+		block := bt[1]
+
+		for _, m := range tjRe.FindAllStringSubmatch(block, -1) {
+			text := pdfUnescapeString(m[1])
+			if isReadablePDFText(text) {
+				parts = append(parts, text)
+			}
+		}
+		for _, m := range tjArrayRe.FindAllStringSubmatch(block, -1) {
+			var sb strings.Builder
+			for _, str := range strInArrayRe.FindAllStringSubmatch(m[1], -1) {
+				sb.WriteString(pdfUnescapeString(str[1]))
+			}
+			if text := sb.String(); isReadablePDFText(text) {
+				parts = append(parts, text)
+			}
+		}
+	}
+
+	result := strings.Join(parts, " ")
+	if len(strings.TrimSpace(result)) < 200 {
+		// Fall back: extract runs of printable ASCII (works even for XFA/stream PDFs)
+		return extractPrintableASCII(data)
+	}
+	return result
+}
+
+func pdfUnescapeString(s string) string {
+	s = strings.ReplaceAll(s, `\n`, "\n")
+	s = strings.ReplaceAll(s, `\r`, "\r")
+	s = strings.ReplaceAll(s, `\t`, "\t")
+	s = strings.ReplaceAll(s, `\\`, `\`)
+	s = strings.ReplaceAll(s, `\(`, `(`)
+	s = strings.ReplaceAll(s, `\)`, `)`)
+	return s
+}
+
+func isReadablePDFText(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	printable := 0
+	for _, c := range s {
+		if c >= 32 && c < 127 {
+			printable++
+		}
+	}
+	return printable > len(s)/2
+}
+
+func extractPrintableASCII(data []byte) string {
+	var sb strings.Builder
+	run := 0
+	for _, b := range data {
+		if (b >= 32 && b < 127) || b == '\n' || b == '\r' || b == '\t' {
+			sb.WriteByte(b)
+			run++
+		} else {
+			if run > 0 {
+				sb.WriteByte('\n')
+			}
+			run = 0
+		}
+	}
+	// Collapse runs of whitespace-only lines
+	re := regexp.MustCompile(`\n{3,}`)
+	return strings.TrimSpace(re.ReplaceAllString(sb.String(), "\n\n"))
+}
+
+// --- Citation extraction ---
+
+// CitationRef holds information about a single citation found in a paper.
+type CitationRef struct {
+	Index   int    // Reference number (if numbered-style)
+	RawText string // Raw citation text as found in the document
+	DOI     string // DOI if found or resolved
+	Title   string // Paper title (filled in from Crossref lookup)
+	Authors string // Author string (filled in from Crossref lookup)
+	Year    string // Year if extractable
+	IsOA    bool   // Whether an open-access version is available
+	PDFURL  string // Open-access PDF URL
+	PageURL string // Landing page URL
+}
+
+func (c *CitationRef) Format() string {
+	var sb strings.Builder
+	if c.Index > 0 {
+		sb.WriteString(fmt.Sprintf("[%d] ", c.Index))
+	}
+	if c.Title != "" {
+		sb.WriteString(fmt.Sprintf("Title: %s\n", c.Title))
+	}
+	if c.Authors != "" {
+		sb.WriteString(fmt.Sprintf("Authors: %s\n", c.Authors))
+	}
+	if c.Year != "" {
+		sb.WriteString(fmt.Sprintf("Year: %s\n", c.Year))
+	}
+	if c.DOI != "" {
+		sb.WriteString(fmt.Sprintf("DOI: %s\n", c.DOI))
+	}
+	if c.PageURL != "" {
+		sb.WriteString(fmt.Sprintf("URL: %s\n", c.PageURL))
+	}
+	if c.PDFURL != "" {
+		sb.WriteString(fmt.Sprintf("PDF: %s\n", c.PDFURL))
+	}
+	sb.WriteString(fmt.Sprintf("Open Access: %v\n", c.IsOA))
+	if c.RawText != "" {
+		raw := c.RawText
+		if len(raw) > 200 {
+			raw = raw[:200] + "..."
+		}
+		sb.WriteString(fmt.Sprintf("Raw: %s\n", raw))
+	}
+	return sb.String()
+}
+
+// extractCitationSection finds the references/bibliography section of a paper.
+func extractCitationSection(text string) string {
+	// Look for common section-header lines (exact or surrounded by newlines)
+	headers := []string{
+		"References", "REFERENCES",
+		"Bibliography", "BIBLIOGRAPHY",
+		"Works Cited", "WORKS CITED",
+		"Literature Cited", "LITERATURE CITED",
+	}
+	for _, h := range headers {
+		// Match the header as its own line
+		for _, sep := range []string{"\n" + h + "\n", "\n" + h + "\r\n", "\n" + h + ":"} {
+			if idx := strings.Index(text, sep); idx >= 0 {
+				return text[idx+1:]
+			}
+		}
+	}
+	return ""
+}
+
+// parseCitationRefs splits a references section into individual CitationRef entries.
+func parseCitationRefs(refSection string, maxCitations int) []CitationRef {
+	if refSection == "" {
+		return nil
+	}
+
+	// Strategy 1: [N] numbered style
+	re1 := regexp.MustCompile(`(?m)^\s*\[(\d+)\]`)
+	locs := re1.FindAllStringIndex(refSection, -1)
+	if len(locs) >= 2 {
+		return parseSplitRefs(refSection, locs, maxCitations, true)
+	}
+
+	// Strategy 2: N. numbered style
+	re2 := regexp.MustCompile(`(?m)^\s*(\d+)\.\s`)
+	locs2 := re2.FindAllStringIndex(refSection, -1)
+	if len(locs2) >= 2 {
+		return parseSplitRefs(refSection, locs2, maxCitations, false)
+	}
+
+	// Strategy 3: just extract DOIs from the text
+	return extractDOIRefs(refSection, maxCitations)
+}
+
+func parseSplitRefs(refSection string, locs [][]int, max int, bracketStyle bool) []CitationRef {
+	var refs []CitationRef
+	for i, loc := range locs {
+		if len(refs) >= max {
+			break
+		}
+		end := len(refSection)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		block := strings.TrimSpace(refSection[loc[0]:end])
+
+		ref := CitationRef{RawText: block}
+
+		// Extract the index number
+		if bracketStyle {
+			reIdx := regexp.MustCompile(`^\[(\d+)\]`)
+			if m := reIdx.FindStringSubmatch(block); len(m) > 1 {
+				ref.Index, _ = strconv.Atoi(m[1])
+			}
+		} else {
+			reIdx := regexp.MustCompile(`^(\d+)\.`)
+			if m := reIdx.FindStringSubmatch(block); len(m) > 1 {
+				ref.Index, _ = strconv.Atoi(m[1])
+			}
+		}
+
+		ref.DOI = extractDOIFromText(block)
+		ref.Year = extractYearFromText(block)
+		if ref.DOI != "" {
+			ref.PageURL = "https://doi.org/" + ref.DOI
+		}
+		refs = append(refs, ref)
+	}
+	return refs
+}
+
+func extractDOIRefs(refSection string, max int) []CitationRef {
+	re := regexp.MustCompile(`(?i)(?:doi:|https?://doi\.org/)?(10\.\d{4,}/[^\s\])\>"',]+)`)
+	seen := map[string]bool{}
+	var refs []CitationRef
+	for _, m := range re.FindAllStringSubmatch(refSection, -1) {
+		if len(refs) >= max {
+			break
+		}
+		doi := strings.TrimRight(m[1], ".,;)")
+		if doi != "" && !seen[doi] {
+			seen[doi] = true
+			refs = append(refs, CitationRef{
+				DOI:     doi,
+				RawText: doi,
+				PageURL: "https://doi.org/" + doi,
+			})
+		}
+	}
+	return refs
+}
+
+func extractDOIFromText(text string) string {
+	re := regexp.MustCompile(`(?i)(?:doi:|https?://doi\.org/)?(10\.\d{4,}/[^\s\])\>"',]+)`)
+	m := re.FindStringSubmatch(text)
+	if len(m) > 1 {
+		return strings.TrimRight(m[1], ".,;)")
+	}
+	return ""
+}
+
+func extractYearFromText(text string) string {
+	re := regexp.MustCompile(`\b(19[0-9]{2}|20[0-2][0-9])\b`)
+	return re.FindString(text)
+}
+
+// lookupCitationViaCrossref enriches a CitationRef by fetching its Crossref metadata.
+func lookupCitationViaCrossref(ctx context.Context, ref *CitationRef, email string) {
+	if ref.DOI == "" {
+		return
+	}
+	apiURL := "https://api.crossref.org/works/" + url.PathEscape(ref.DOI)
+	if email != "" {
+		apiURL += "?mailto=" + url.QueryEscape(email)
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := doHTTPRequest(req, 10*time.Second)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+
+	var data struct {
+		Message struct {
+			Title  []string `json:"title"`
+			Author []struct {
+				Given  string `json:"given"`
+				Family string `json:"family"`
+			} `json:"author"`
+			Published struct {
+				DateParts [][]int `json:"date-parts"`
+			} `json:"published"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return
+	}
+	if len(data.Message.Title) > 0 {
+		ref.Title = data.Message.Title[0]
+	}
+	if len(data.Message.Author) > 0 {
+		var authors []string
+		for _, a := range data.Message.Author {
+			name := strings.TrimSpace(a.Given + " " + a.Family)
+			if name != "" {
+				authors = append(authors, name)
+			}
+		}
+		ref.Authors = strings.Join(authors, ", ")
+	}
+	if len(data.Message.Published.DateParts) > 0 && len(data.Message.Published.DateParts[0]) > 0 {
+		ref.Year = fmt.Sprintf("%d", data.Message.Published.DateParts[0][0])
+	}
+}
+
+// enrichCitationOA checks open-access availability for a citation via Unpaywall.
+func enrichCitationOA(ctx context.Context, ref *CitationRef, email string) {
+	if ref.DOI == "" || email == "" {
+		return
+	}
+	pdfURL, err := unpaywallLookup(ctx, ref.DOI, email)
+	if err != nil || pdfURL == "" {
+		return
+	}
+	ref.IsOA = true
+	ref.PDFURL = pdfURL
+}
+
+// downloadCitationPaper downloads a cited paper PDF to the given path.
+// Returns true on success.
+func downloadCitationPaper(ctx context.Context, ref *CitationRef, savePath string, fs fileSystem) bool {
+	if ref.PDFURL == "" {
+		return false
+	}
+	body, _, ct, err := fetchURLWithRedirects(ctx, ref.PDFURL)
+	if err != nil || !detectPDF(body, ct, ref.PDFURL) {
+		return false
+	}
+	return fs.WriteFile(savePath, body) == nil
+}
+
+// citationSavePath builds a safe file path for a downloaded citation paper.
+func citationSavePath(dir string, ref CitationRef) string {
+	name := ""
+	if ref.DOI != "" {
+		name = strings.NewReplacer("/", "_", ":", "_", " ", "_").Replace(ref.DOI)
+	} else if ref.Index > 0 {
+		name = fmt.Sprintf("citation_%d", ref.Index)
+	} else {
+		name = fmt.Sprintf("citation_%d", time.Now().UnixNano())
+	}
+	return filepath.Join(dir, name+".pdf")
+}
+
+// --- AcademicExtractCitationsTool ---
+
+// AcademicExtractCitationsTool reads a saved paper file (PDF or TXT), extracts its
+// reference list, looks each citation up via Crossref, checks open-access availability
+// via Unpaywall, and optionally downloads the available cited papers.
+type AcademicExtractCitationsTool struct {
+	emailForPolite string
+	fs             fileSystem
+}
+
+// NewAcademicExtractCitationsTool creates a new AcademicExtractCitationsTool.
+func NewAcademicExtractCitationsTool(emailForPolite, workspace string, restrict bool) *AcademicExtractCitationsTool {
+	var fs fileSystem
+	if restrict {
+		fs = &sandboxFs{workspace: workspace}
+	} else {
+		fs = &hostFs{}
+	}
+	return &AcademicExtractCitationsTool{emailForPolite: emailForPolite, fs: fs}
+}
+
+func (t *AcademicExtractCitationsTool) Name() string {
+	return "academic_extract_citations"
+}
+
+func (t *AcademicExtractCitationsTool) Description() string {
+	return "Read a saved paper file (PDF or TXT), extract its reference list, look each citation up via Crossref, " +
+		"check open-access availability via Unpaywall, and optionally auto-download the available cited papers. " +
+		"Returns a report listing every found citation with its metadata and download status. " +
+		"PDF text extraction is best-effort and works for most unencrypted, text-based PDFs."
+}
+
+func (t *AcademicExtractCitationsTool) Parameters() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"file_path": map[string]any{
+				"type":        "string",
+				"description": "Path to the saved paper file (PDF or TXT)",
+			},
+			"max_citations": map[string]any{
+				"type":        "integer",
+				"description": "Maximum citations to process (1-50, default 20)",
+				"minimum":     1.0,
+				"maximum":     50.0,
+			},
+			"download_available": map[string]any{
+				"type":        "boolean",
+				"description": "If true, automatically download open-access PDFs of cited papers to save_dir",
+			},
+			"save_dir": map[string]any{
+				"type":        "string",
+				"description": "Directory to save downloaded cited papers (required when download_available=true)",
+			},
+			"save_report_to": map[string]any{
+				"type":        "string",
+				"description": "Optional path to save the citation analysis report as a text file",
+			},
+		},
+		"required": []string{"file_path"},
+	}
+}
+
+func (t *AcademicExtractCitationsTool) Execute(ctx context.Context, args map[string]any) *ToolResult {
+	filePath, ok := args["file_path"].(string)
+	if !ok || filePath == "" {
+		return ErrorResult("file_path is required")
+	}
+
+	maxCitations := 20
+	if mc, ok := args["max_citations"].(float64); ok && int(mc) > 0 && int(mc) <= 50 {
+		maxCitations = int(mc)
+	}
+
+	downloadAvailable, _ := args["download_available"].(bool)
+	saveDir, _ := args["save_dir"].(string)
+	saveReportTo, _ := args["save_report_to"].(string)
+
+	if downloadAvailable && saveDir == "" {
+		return ErrorResult("save_dir is required when download_available=true")
+	}
+
+	// Read the paper file
+	fileData, err := t.fs.ReadFile(filePath)
+	if err != nil {
+		return ErrorResult(fmt.Sprintf("failed to read file: %v", err))
+	}
+
+	// Extract text
+	var text string
+	if len(fileData) >= 4 && string(fileData[:4]) == "%PDF" {
+		text = extractTextFromPDF(fileData)
+	} else {
+		text = string(fileData)
+	}
+
+	if len(strings.TrimSpace(text)) == 0 {
+		return ErrorResult("no text content could be extracted from the file")
+	}
+
+	// Find the references section
+	refSection := extractCitationSection(text)
+	if refSection == "" {
+		// No dedicated section found — scan the whole text for DOIs
+		refSection = text
+	}
+
+	// Parse citations
+	refs := parseCitationRefs(refSection, maxCitations)
+	if len(refs) == 0 {
+		return &ToolResult{
+			ForLLM:  "No citations could be extracted from the paper (no reference section or DOIs found)",
+			ForUser: "No citations could be extracted from the paper (no reference section or DOIs found)",
+		}
+	}
+
+	// Enrich each citation and optionally download
+	var downloadedCount int
+	for i := range refs {
+		if ctx.Err() != nil {
+			break
+		}
+		if refs[i].DOI != "" {
+			lookupCitationViaCrossref(ctx, &refs[i], t.emailForPolite)
+			enrichCitationOA(ctx, &refs[i], t.emailForPolite)
+		}
+		if downloadAvailable && refs[i].IsOA && refs[i].PDFURL != "" {
+			sp := citationSavePath(saveDir, refs[i])
+			if downloadCitationPaper(ctx, &refs[i], sp, t.fs) {
+				downloadedCount++
+			}
+		}
+	}
+
+	// Build the report
+	oaCount := 0
+	for _, r := range refs {
+		if r.IsOA {
+			oaCount++
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Citation analysis of %s\n", filePath))
+	sb.WriteString(fmt.Sprintf("Found %d citations", len(refs)))
+	if t.emailForPolite != "" {
+		sb.WriteString(fmt.Sprintf(", %d open access", oaCount))
+	}
+	if downloadAvailable {
+		sb.WriteString(fmt.Sprintf(", %d downloaded", downloadedCount))
+	}
+	sb.WriteString("\n\n")
+
+	for i, ref := range refs {
+		sb.WriteString(fmt.Sprintf("--- Citation %d ---\n", i+1))
+		sb.WriteString(ref.Format())
+		sb.WriteString("\n")
+	}
+
+	report := sb.String()
+
+	if saveReportTo != "" {
+		if err := t.fs.WriteFile(saveReportTo, []byte(report)); err != nil {
+			return ErrorResult(fmt.Sprintf("analysis done but failed to save report: %v", err))
+		}
+		summary := fmt.Sprintf("Found %d citations (%d open access). Report saved to %s", len(refs), oaCount, saveReportTo)
+		return &ToolResult{ForLLM: summary, ForUser: report}
+	}
+
+	return &ToolResult{ForLLM: report, ForUser: report}
 }

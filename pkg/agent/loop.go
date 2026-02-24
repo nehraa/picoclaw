@@ -155,6 +155,7 @@ func registerSharedTools(
 			restrictWS := cfg.Agents.Defaults.RestrictToWorkspace
 			agent.Tools.Register(tools.NewAcademicSearchTool(academicOpts, agent.Workspace, restrictWS))
 			agent.Tools.Register(tools.NewAcademicFetchPaperTool(cfg.Tools.Academic.EmailForPolite, agent.Workspace, restrictWS))
+			agent.Tools.Register(tools.NewAcademicExtractCitationsTool(cfg.Tools.Academic.EmailForPolite, agent.Workspace, restrictWS))
 		}
 
 		// Spawn tool with allowlist checker
