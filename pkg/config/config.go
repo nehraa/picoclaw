@@ -468,10 +468,31 @@ type ExecConfig struct {
 }
 
 type ToolsConfig struct {
-	Web    WebToolsConfig    `json:"web"`
-	Cron   CronToolsConfig   `json:"cron"`
-	Exec   ExecConfig        `json:"exec"`
-	Skills SkillsToolsConfig `json:"skills"`
+	Web      WebToolsConfig      `json:"web"`
+	Cron     CronToolsConfig     `json:"cron"`
+	Exec     ExecConfig          `json:"exec"`
+	Skills   SkillsToolsConfig   `json:"skills"`
+	Academic AcademicToolsConfig `json:"academic"`
+}
+
+// AcademicToolsConfig holds configuration for academic paper search and download tools.
+type AcademicToolsConfig struct {
+	// Enabled controls whether the academic search and fetch tools are registered.
+	// Defaults to false (Go zero value); set to true to activate the tools.
+	Enabled bool `json:"enabled" env:"PICOCLAW_TOOLS_ACADEMIC_ENABLED"`
+	// EmailForPolite is used as the contact email in API requests that support a
+	// "polite pool" (e.g. Crossref, Unpaywall). It is also required for Unpaywall DOI lookups.
+	EmailForPolite string `json:"email_for_polite,omitempty" env:"PICOCLAW_TOOLS_ACADEMIC_EMAIL_FOR_POLITE"`
+	// MaxResultsPerSource is the default number of results fetched from each source (default 5).
+	MaxResultsPerSource int `json:"max_results_per_source,omitempty" env:"PICOCLAW_TOOLS_ACADEMIC_MAX_RESULTS_PER_SOURCE"`
+	// API keys for sources that require authentication.
+	// Free sources (OpenAlex, arXiv, PLOS, PubMed, Crossref, DOAJ, DBLP) need no key.
+	SemanticScholarAPIKey string `json:"semantic_scholar_api_key,omitempty" env:"PICOCLAW_TOOLS_ACADEMIC_SEMANTIC_SCHOLAR_API_KEY"`
+	SpringerAPIKey        string `json:"springer_api_key,omitempty"         env:"PICOCLAW_TOOLS_ACADEMIC_SPRINGER_API_KEY"`
+	IEEEAPIKey            string `json:"ieee_api_key,omitempty"             env:"PICOCLAW_TOOLS_ACADEMIC_IEEE_API_KEY"`
+	ElsevierAPIKey        string `json:"elsevier_api_key,omitempty"         env:"PICOCLAW_TOOLS_ACADEMIC_ELSEVIER_API_KEY"`
+	LensAPIKey            string `json:"lens_api_key,omitempty"             env:"PICOCLAW_TOOLS_ACADEMIC_LENS_API_KEY"`
+	PubMedAPIKey          string `json:"pubmed_api_key,omitempty"           env:"PICOCLAW_TOOLS_ACADEMIC_PUBMED_API_KEY"`
 }
 
 type SkillsToolsConfig struct {

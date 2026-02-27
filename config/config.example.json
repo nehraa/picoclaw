@@ -237,6 +237,18 @@
           "download_path": "/api/v1/download"
         }
       }
+    },
+    "academic": {
+      "enabled": false,
+      "email_for_polite": "your-email@example.com",
+      "max_results_per_source": 5,
+      "_comment": "API keys are only needed for the paid/restricted sources. OpenAlex, arXiv, PLOS, PubMed, Crossref, DOAJ, and DBLP are free.",
+      "semantic_scholar_api_key": "",
+      "springer_api_key": "",
+      "ieee_api_key": "",
+      "elsevier_api_key": "",
+      "lens_api_key": "",
+      "pubmed_api_key": ""
     }
   },
   "heartbeat": {

@@ -140,6 +140,24 @@ func registerSharedTools(
 		agent.Tools.Register(tools.NewFindSkillsTool(registryMgr, searchCache))
 		agent.Tools.Register(tools.NewInstallSkillTool(registryMgr, agent.Workspace))
 
+		// Academic paper search and fetch tools
+		if cfg.Tools.Academic.Enabled {
+			academicOpts := tools.AcademicSearchToolOptions{
+				EmailForPolite:        cfg.Tools.Academic.EmailForPolite,
+				MaxResultsPerSource:   cfg.Tools.Academic.MaxResultsPerSource,
+				SemanticScholarAPIKey: cfg.Tools.Academic.SemanticScholarAPIKey,
+				SpringerAPIKey:        cfg.Tools.Academic.SpringerAPIKey,
+				IEEEAPIKey:            cfg.Tools.Academic.IEEEAPIKey,
+				ElsevierAPIKey:        cfg.Tools.Academic.ElsevierAPIKey,
+				LensAPIKey:            cfg.Tools.Academic.LensAPIKey,
+				PubMedAPIKey:          cfg.Tools.Academic.PubMedAPIKey,
+			}
+			restrictWS := cfg.Agents.Defaults.RestrictToWorkspace
+			agent.Tools.Register(tools.NewAcademicSearchTool(academicOpts, agent.Workspace, restrictWS))
+			agent.Tools.Register(tools.NewAcademicFetchPaperTool(cfg.Tools.Academic.EmailForPolite, agent.Workspace, restrictWS))
+			agent.Tools.Register(tools.NewAcademicExtractCitationsTool(cfg.Tools.Academic.EmailForPolite, agent.Workspace, restrictWS))
+		}
+
 		// Spawn tool with allowlist checker
 		subagentManager := tools.NewSubagentManager(provider, agent.Model, agent.Workspace, msgBus)
 		subagentManager.SetLLMOptions(agent.MaxTokens, agent.Temperature)
